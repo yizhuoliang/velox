@@ -14,6 +14,16 @@
 cmake_minimum_required(VERSION 3.28)
 message(STATUS "Building using CMake version: ${CMAKE_VERSION}")
 
+# -------- FOR LDB -----------
+# Import libldb as an external static library
+add_library(libldb STATIC IMPORTED)
+set_target_properties(libldb PROPERTIES IMPORTED_LOCATION "/home/cc/llvm14-ldb/libldb/libldb.a")
+
+# Pretend to be standard library, add the library path for all executables in this way
+set(CMAKE_C_STANDARD_LIBRARIES "${CMAKE_C_STANDARD_LIBRARIES} /home/cc/llvm14-ldb/libldb/libldb.a")
+set(CMAKE_CXX_STANDARD_LIBRARIES "${CMAKE_CXX_STANDARD_LIBRARIES} /home/cc/llvm14-ldb/libldb/libldb.a")
+# ----------------------------
+
 # The policy allows us to change options without caching.
 cmake_policy(SET CMP0077 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
