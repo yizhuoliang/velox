@@ -27,6 +27,8 @@ add_subdirectory(external/md5)
 add_subdirectory(external/hdfs)
 #
 
+# enable -03 for inserting ldb instructions
+add_compile_options(-O3)
 add_subdirectory(hrp_benchmarks)
 
 # examples depend on expression
