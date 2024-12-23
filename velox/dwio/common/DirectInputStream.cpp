@@ -143,7 +143,7 @@ void DirectInputStream::loadSync() {
     }
   }
 
-  process::TraceContext trace("DirectInputStream::loadSync");
+  // process::TraceContext trace("DirectInputStream::loadSync");
 
   ioStats_->incRawBytesRead(loadedRegion_.length);
   auto ranges = makeRanges(loadedRegion_.length, data_, tinyData_);

@@ -44,7 +44,7 @@ std::unique_ptr<FileHandle> FileHandleGenerator::operator()(
     const FileProperties* properties) {
   // We have seen cases where drivers are stuck when creating file handles.
   // Adding a trace here to spot this more easily in future.
-  process::TraceContext trace("FileHandleGenerator::operator()");
+  // process::TraceContext trace("FileHandleGenerator::operator()");
   uint64_t elapsedTimeUs{0};
   std::unique_ptr<FileHandle> fileHandle;
   {

@@ -66,6 +66,7 @@ class TraceHistory {
   /// new entry should be done in the functor `init'.
   template <typename F>
   static void push(F&& init) {
+    return;
     detail::traceHistory.withValue(
         [init = std::forward<F>(init)](auto& history) {
           auto& entry = history.data_[history.index_];

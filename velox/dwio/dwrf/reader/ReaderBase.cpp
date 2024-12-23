@@ -89,7 +89,7 @@ ReaderBase::ReaderBase(
       options_{options},
       input_(std::move(input)),
       fileLength_(input_->getReadFile()->size()) {
-  process::TraceContext trace("ReaderBase::ReaderBase");
+  // process::TraceContext trace("ReaderBase::ReaderBase");
   // TODO: make a config
   DWIO_ENSURE(fileLength_ > 0, "ORC file is empty");
   VELOX_CHECK_GE(fileLength_, 4, "File size too small");

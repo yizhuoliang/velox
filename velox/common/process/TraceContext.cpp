@@ -37,6 +37,7 @@ TraceContext::TraceContext(std::string label, bool isTemporary)
       enterTime_(std::chrono::steady_clock::now()),
       isTemporary_(isTemporary),
       traceData_(threadLocalTraceData) {
+  return;
   TraceHistory::push([&](auto& entry) {
     entry.time = enterTime_;
     entry.file = __FILE__;
@@ -54,6 +55,7 @@ TraceContext::TraceContext(std::string label, bool isTemporary)
 }
 
 TraceContext::~TraceContext() {
+  return;
   traceData_->withValue([&](auto& counts) {
     auto it = counts.find(label_);
     auto& data = it->second;

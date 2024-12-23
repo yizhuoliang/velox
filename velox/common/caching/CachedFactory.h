@@ -364,7 +364,7 @@ template <
 CachedPtr<Key, Value, Comparator, Hash>
 CachedFactory<Key, Value, Generator, Properties, Sizer, Comparator, Hash>::
     generate(const Key& key, const Properties* properties) {
-  process::TraceContext trace("CachedFactory::generate");
+  // process::TraceContext trace("CachedFactory::generate");
   if (cache_ == nullptr) {
     return CachedPtr<Key, Value, Comparator, Hash>{
         /*fromCache=*/false,

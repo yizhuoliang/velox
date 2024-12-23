@@ -22,9 +22,7 @@ Should call `make clean` then `ccache -C` for a brand new build!
 For building original velox, note that only gcc/g++ 11 work! So use
 ```
 make EXTRA_CMAKE_FLAGS="\
-  -DCMAKE_C_FLAGS='-fno-omit-frame-pointer -g' \
-  -DCMAKE_CXX_FLAGS='-fno-omit-frame-pointer -g' \
-  -DCMAKE_C_COMPILER=/usr/bin/gcc-11 \
-  -DCMAKE_CXX_COMPILER=/usr/bin/g++-11 \
+  -DCMAKE_C_COMPILER=/usr/bin/clang-15 \
+  -DCMAKE_CXX_COMPILER=/usr/bin/clang++-15 \
   -DCMAKE_VERBOSE_MAKEFILE=ON"
 ```

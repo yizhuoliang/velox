@@ -17,6 +17,10 @@
 #include <mutex>
 #include <condition_variable>
 
+extern "C" {
+  #include "hrperf_api.h"
+}
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec::test;
 
@@ -55,7 +59,8 @@ void workerThread(
     int64_t numRows,
     int64_t numCols,
     ThreadResult* result,
-    Barrier& barrier) {
+    Barrier& barrier,
+    int64_t threadIndex) {
   std::this_thread::sleep_for(std::chrono::seconds(1));
   // Initialize Executor and Execution Context.
   auto pool = memory::memoryManager()->addLeafPool();
@@ -70,7 +75,7 @@ void workerThread(
   columns.reserve(numCols);
   columnNames.reserve(numCols);
 
-  std::mt19937_64 rng;
+  std::mt19937_64 rng(42 + threadIndex);  // Seed the RNG with a fixed seed plus thread index
   std::uniform_int_distribution<int64_t> dist;
 
   for (int64_t col = 0; col < numCols; ++col) {
@@ -166,6 +171,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  hrperf_start();
+
   int64_t numRows = std::stoll(argv[1]);
   int64_t numCols = std::stoll(argv[2]);
   int64_t numThreads = std::stoll(argv[3]);
@@ -205,7 +212,7 @@ int main(int argc, char** argv) {
   threads.reserve(numThreads);
 
   for (int64_t i = 0; i < numThreads; ++i) {
-    threads.emplace_back(workerThread, numRows, numCols, &threadResults[i], std::ref(barrier));
+    threads.emplace_back(workerThread, numRows, numCols, &threadResults[i], std::ref(barrier), i);
   }
 
   // Wait for threads to finish.
@@ -230,6 +237,7 @@ int main(int argc, char** argv) {
   std::cout << "Max execution time: " << maxTime << " seconds" << std::endl;
   std::cout << "Average execution time: " << avgTime << " seconds" << std::endl;
 
+  hrperf_pause();
   std::this_thread::sleep_for(std::chrono::seconds(3));
 
   return 0;
