@@ -17,6 +17,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <optional>
 
 // Velox + test namespace usage.
 using namespace facebook::velox;
@@ -282,52 +283,127 @@ int main(int argc, char** argv) {
     std::vector<ThreadResult> tripleResults1(tripleCount1);
     std::vector<ThreadResult> sinResults1(sinCount1);
 
-    // We'll store the actual thread objects so we can join them.
-    std::vector<std::thread> tripleThreads1;
-    tripleThreads1.reserve(tripleCount1);
+    // Task queue for thread reuse
+    struct TaskInfo {
+      enum TaskType { TRIPLE, SIN } type;
+      int index;
+    };
 
-    std::mutex sinThreads1Mutex;
-    std::vector<std::thread> sinThreads1;
+    std::mutex taskQueueMutex;
+    std::condition_variable taskQueueCV;
+    std::vector<TaskInfo> taskQueue;
+    std::atomic<bool> allTasksEnqueued{false};
+
+    // Thread tracking for join
+    std::mutex threadsMutex;
+    std::vector<std::thread> workerThreads;
+
+    // Track how many are done
+    std::atomic<int> doneTriple1{0};
+    std::atomic<int> doneSin1{0};
 
     // Barrier for triple only
     SimpleBarrier tripleBarrier1(tripleCount1);
 
-    std::atomic<int> tripleFinishedCount1{0};
-
-    // Round 1 triple
-    auto tripleWorker1 = [&](int idx) {
-      tripleWorker(tripleData1[idx], numCols, &tripleResults1[idx], &tripleBarrier1);
-      // spawn sin
-      int finishedCount = tripleFinishedCount1.fetch_add(1);
-      if (finishedCount < (int)sinCount1) {
-        // sin index
-        int sinIdx = finishedCount;
-        std::thread st([&, sinIdx]() {
-          sinWorker(sinData1[sinIdx], numCols, &sinResults1[sinIdx], nullptr);
+    // Function to get the next task from the queue
+    auto getNextTask = [&]() -> std::optional<TaskInfo> {
+      std::unique_lock<std::mutex> lock(taskQueueMutex);
+      // Wait for a task if queue is empty but not all tasks are enqueued yet
+      if (taskQueue.empty()) {
+        if (allTasksEnqueued.load()) {
+          return std::nullopt; // No more tasks
+        }
+        // Wait for a task to be added or all tasks to be enqueued
+        taskQueueCV.wait(lock, [&]() { 
+          return !taskQueue.empty() || allTasksEnqueued.load(); 
         });
-        // store
-        {
-          std::lock_guard<std::mutex> lk(sinThreads1Mutex);
-          sinThreads1.push_back(std::move(st));
+        if (taskQueue.empty()) {
+          return std::nullopt; // Still no task after waking up
+        }
+      }
+      
+      // Get task from queue
+      TaskInfo task = taskQueue.back();
+      taskQueue.pop_back();
+      return task;
+    };
+
+    // Function to add a task to the queue
+    auto addTaskToQueue = [&](TaskInfo task) {
+      {
+        std::lock_guard<std::mutex> lock(taskQueueMutex);
+        taskQueue.push_back(task);
+      }
+      taskQueueCV.notify_one();
+    };
+    
+    // Worker thread function that processes tasks from the queue
+    auto workerThreadFunc = [&]() {
+      while (true) {
+        // Get next task from queue
+        auto taskOpt = getNextTask();
+        if (!taskOpt) {
+          // No more tasks
+          break;
+        }
+
+        auto task = *taskOpt;
+        
+        // Execute the task
+        if (task.type == TaskInfo::TRIPLE) {
+          // Triple task will use the barrier
+          tripleWorker(tripleData1[task.index], numCols, &tripleResults1[task.index], &tripleBarrier1);
+          
+          // Mark as done
+          int finishedCount = doneTriple1.fetch_add(1);
+          
+          // Each finished triple task spawns a sin task if we haven't spawned all sins yet
+          if (finishedCount < (int)sinCount1) {
+            // Add a sin task to the queue
+            int sinIdx = finishedCount;
+            addTaskToQueue({TaskInfo::SIN, sinIdx});
+          }
+        } else {
+          // Sin task - no barrier
+          sinWorker(sinData1[task.index], numCols, &sinResults1[task.index], nullptr);
+          
+          // Mark as done
+          doneSin1.fetch_add(1);
         }
       }
     };
 
-    // Start all triple
+    // 1. Enqueue all triple tasks
     for (int i = 0; i < tripleCount1; ++i) {
-      tripleThreads1.emplace_back(tripleWorker1, i);
+      addTaskToQueue({TaskInfo::TRIPLE, i});
     }
 
-    // Join triple
-    for (auto &t : tripleThreads1) {
-      t.join();
+    // 2. Start worker threads (2*userThreads of them to match maxConcurrency)
+    int64_t maxConcurrency = 2 * userThreads;
+    for (int i = 0; i < maxConcurrency; ++i) {
+      workerThreads.emplace_back(workerThreadFunc);
     }
 
-    // Join all sin
-    {
-      std::lock_guard<std::mutex> lk(sinThreads1Mutex);
-      for (auto &t : sinThreads1) {
-        t.join();
+    // 3. Wait until all triple and sin tasks are done
+    while (doneTriple1.load() < tripleCount1 || doneSin1.load() < sinCount1) {
+      // Check if any triple tasks have completed
+      if (doneSin1.load() < sinCount1) {
+        // Sleep a bit to avoid busy-waiting
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      } else {
+        // All sin tasks are done, just need to wait for any remaining triple tasks
+        break;
+      }
+    }
+
+    // Mark that all tasks have been enqueued
+    allTasksEnqueued.store(true);
+    taskQueueCV.notify_all();
+
+    // 4. Join all worker threads
+    for (auto &th : workerThreads) {
+      if (th.joinable()) {
+        th.join();
       }
     }
 
@@ -387,120 +463,195 @@ int main(int argc, char** argv) {
     int64_t maxConcurrency = 2 * userThreads;
     // how many are currently RUNNING
     std::atomic<int> activeThreads{0};
+    // Track which type of task was last spawned (to alternate)
+    std::atomic<bool> lastSpawnedSin{false};
+
+    // Task queue for thread reuse
+    struct TaskInfo {
+      enum TaskType { TRIPLE, SIN } type;
+      int index;
+      bool isFirstBatch;
+    };
+    
+    std::mutex taskQueueMutex;
+    std::condition_variable taskQueueCV;
+    std::vector<TaskInfo> taskQueue;
+    std::atomic<bool> allTasksEnqueued{false};
 
     // barrier for first half triple + sin
     SimpleBarrier round2Barrier((int)userThreads + (int)userThreads);
 
-    // We'll define worker lambdas for triple & sin that:
-    //  - do optional barrier
-    //  - run
-    //  - on finish, decrement activeThreads, then call spawnIfPossible() to fill up concurrency
-    std::function<void(int,bool)> doTriple2;
-    std::function<void(int,bool)> doSin2;
+    // Function to get the next task from the queue
+    auto getNextTask = [&]() -> std::optional<TaskInfo> {
+      std::unique_lock<std::mutex> lock(taskQueueMutex);
+      // Wait for a task if queue is empty but not all tasks are enqueued yet
+      if (taskQueue.empty()) {
+        if (allTasksEnqueued.load()) {
+          return std::nullopt; // No more tasks
+        }
+        // Wait for a task to be added or all tasks to be enqueued
+        taskQueueCV.wait(lock, [&]() { 
+          return !taskQueue.empty() || allTasksEnqueued.load(); 
+        });
+        if (taskQueue.empty()) {
+          return std::nullopt; // Still no task after waking up
+        }
+      }
+      
+      // Get task from queue
+      TaskInfo task = taskQueue.back();
+      taskQueue.pop_back();
+      return task;
+    };
 
-    // We'll define a function to spawn as many tasks as possible to keep concurrency saturated,
-    // favoring sin first. Called after a worker finishes.
+    // Function to add a task to the queue
+    auto addTaskToQueue = [&](TaskInfo task) {
+      {
+        std::lock_guard<std::mutex> lock(taskQueueMutex);
+        taskQueue.push_back(task);
+      }
+      taskQueueCV.notify_one();
+    };
+
+    // We'll define a function to enqueue more tasks as needed
     std::mutex spawnMutex; // protect spawn logic
 
-    auto spawnIfPossible = [&](bool fromThreadFinish) {
-      // If multiple threads finish nearly at once, we want them all to call spawnIfPossible.
-      // We lock to avoid overlapping spawns.
+    auto enqueueNextTaskIfPossible = [&]() {
+      // If multiple threads finish nearly at once, we want them all to call this.
+      // We lock to avoid overlapping enqueues.
       std::lock_guard<std::mutex> lk(spawnMutex);
 
-      while (true) {
-        // how many are active?
-        int currentActive = (int)activeThreads.load();
-        if (currentActive >= (int)maxConcurrency) {
-          // we're at concurrency limit
-          break;
-        }
-        // if we can spawn more, do we have sin left?
+      // Only enqueue a new task if we have capacity
+      int currentActive = (int)activeThreads.load();
+      if (currentActive >= (int)maxConcurrency) {
+        return false; // at concurrency limit
+      }
+
+      bool taskEnqueued = false;
+      bool trySinFirst = !lastSpawnedSin.load();
+
+      // Try to enqueue the first task type (alternating sin/triple)
+      if (trySinFirst) {
         int s = nextSinIdx.load();
         if (s < (int)sinCount2) {
-          // we attempt to claim sin s
           if (nextSinIdx.compare_exchange_strong(s, s + 1)) {
-            // spawn sin s
+            // Enqueue sin task
             activeThreads.fetch_add(1);
-            std::thread newT([&, s]() {
-              doSin2(s, false);
-            });
-            {
-              std::lock_guard<std::mutex> lk2(round2ThreadsMutex);
-              round2Threads.push_back(std::move(newT));
-            }
-            continue; // see if we can spawn more in same loop
+            addTaskToQueue({TaskInfo::SIN, s, false});
+            lastSpawnedSin.store(true);
+            taskEnqueued = true;
           }
         }
-        // else try triple
+      } else {
         int t = nextTripleIdx.load();
         if (t < (int)tripleCount2) {
           if (nextTripleIdx.compare_exchange_strong(t, t + 1)) {
+            // Enqueue triple task
             activeThreads.fetch_add(1);
-            std::thread newT([&, t]() {
-              doTriple2(t, false);
-            });
-            {
-              std::lock_guard<std::mutex> lk2(round2ThreadsMutex);
-              round2Threads.push_back(std::move(newT));
-            }
-            continue;
+            addTaskToQueue({TaskInfo::TRIPLE, t, false});
+            lastSpawnedSin.store(false);
+            taskEnqueued = true;
           }
         }
-        // no more sin or triple left
-        break;
+      }
+
+      // If we couldn't enqueue the preferred type, try the other type
+      if (!taskEnqueued) {
+        if (trySinFirst) {
+          // We tried sin first but couldn't enqueue, now try triple
+          int t = nextTripleIdx.load();
+          if (t < (int)tripleCount2) {
+            if (nextTripleIdx.compare_exchange_strong(t, t + 1)) {
+              // Enqueue triple task
+              activeThreads.fetch_add(1);
+              addTaskToQueue({TaskInfo::TRIPLE, t, false});
+              lastSpawnedSin.store(false);
+              taskEnqueued = true;
+            }
+          }
+        } else {
+          // We tried triple first but couldn't enqueue, now try sin
+          int s = nextSinIdx.load();
+          if (s < (int)sinCount2) {
+            if (nextSinIdx.compare_exchange_strong(s, s + 1)) {
+              // Enqueue sin task
+              activeThreads.fetch_add(1);
+              addTaskToQueue({TaskInfo::SIN, s, false});
+              lastSpawnedSin.store(true);
+              taskEnqueued = true;
+            }
+          }
+        }
+      }
+
+      return taskEnqueued;
+    };
+
+    // Worker thread function that processes tasks from the queue
+    auto workerThreadFunc = [&]() {
+      while (true) {
+        // Get next task from queue
+        auto taskOpt = getNextTask();
+        if (!taskOpt) {
+          // No more tasks
+          break;
+        }
+
+        auto task = *taskOpt;
+        
+        // Execute the task
+        if (task.type == TaskInfo::TRIPLE) {
+          // Execute triple task
+          SimpleBarrier* b = (task.isFirstBatch ? &round2Barrier : nullptr);
+          tripleWorker(tripleData2[task.index], numCols, &tripleResults2[task.index], b);
+          
+          // Mark as done
+          doneTriple2.fetch_add(1);
+          activeThreads.fetch_sub(1);
+        } else {
+          // Execute sin task
+          SimpleBarrier* b = (task.isFirstBatch ? &round2Barrier : nullptr);
+          sinWorker(sinData2[task.index], numCols, &sinResults2[task.index], b);
+          
+          // Mark as done
+          doneSin2.fetch_add(1);
+          activeThreads.fetch_sub(1);
+        }
+
+        // Try to enqueue next task
+        enqueueNextTaskIfPossible();
       }
     };
 
-    // Implementation of triple2
-    doTriple2 = [&](int idx, bool isFirstBatch) {
-      // optional barrier
-      SimpleBarrier* b = (isFirstBatch ? &round2Barrier : nullptr);
-      tripleWorker(tripleData2[idx], numCols, &tripleResults2[idx], b);
-
-      // done
-      doneTriple2.fetch_add(1);
-      activeThreads.fetch_sub(1);
-
-      // attempt to spawn more tasks
-      spawnIfPossible(/*fromThreadFinish=*/true);
-    };
-
-    // Implementation of sin2
-    doSin2 = [&](int idx, bool isFirstBatch) {
-      SimpleBarrier* b = (isFirstBatch ? &round2Barrier : nullptr);
-      sinWorker(sinData2[idx], numCols, &sinResults2[idx], b);
-
-      // done
-      doneSin2.fetch_add(1);
-      activeThreads.fetch_sub(1);
-
-      // try spawn
-      spawnIfPossible(/*fromThreadFinish=*/true);
-    };
-
-    // 1) Start initial half triple + half sin
-    //   we do userThreads triple, userThreads sin => total 2*userThreads => saturate concurrency immediately.
+    // 1) Enqueue initial batch of tasks
+    // First, enqueue userThreads triple and userThreads sin tasks (first batch)
+    // in an alternating pattern for consistency with later task spawning
     for (int i = 0; i < (int)userThreads; ++i) {
+      // Add a triple task
       activeThreads.fetch_add(1);
-      round2Threads.emplace_back([&, i]() {
-        doTriple2(i, true);
-      });
-    }
-    for (int i = 0; i < (int)userThreads; ++i) {
+      addTaskToQueue({TaskInfo::TRIPLE, i, true});
+      
+      // Add a sin task
       activeThreads.fetch_add(1);
-      round2Threads.emplace_back([&, i]() {
-        doSin2(i, true);
-      });
+      addTaskToQueue({TaskInfo::SIN, i, true});
     }
 
-    // 2) Wait until all tasks are done
-    //    We'll do a loop, then join all threads after that.
-    while ((int)doneTriple2.load() < (int)tripleCount2 ||
-           (int)doneSin2.load() < (int)sinCount2) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    // 2) Start worker threads (2*userThreads of them to match maxConcurrency)
+    for (int i = 0; i < maxConcurrency; ++i) {
+      round2Threads.emplace_back(workerThreadFunc);
     }
 
-    // 3) Now join everything
+    // 3) Keep trying to enqueue tasks until all are enqueued
+    while (nextTripleIdx.load() < tripleCount2 || nextSinIdx.load() < sinCount2) {
+      enqueueNextTaskIfPossible();
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // Mark that all tasks have been enqueued
+    allTasksEnqueued.store(true);
+    taskQueueCV.notify_all();
+
+    // 4) Wait for all threads to finish
     for (auto &th : round2Threads) {
       if (th.joinable()) {
         th.join();
